@@ -1,26 +1,28 @@
 import { useEffect, useState } from "react";
 import { api } from "./api";
+import { isActiveRun } from "./activity";
+import { useActivity } from "./useActivity";
 import { AlignmentStudio } from "./components/AlignmentStudio";
+import { ActivityBar } from "./components/ActivityBar";
 import { EvaluationHub } from "./components/EvaluationHub";
 import { Factory } from "./components/Factory";
 import { InferenceEngine } from "./components/InferenceEngine";
 import { Microscope } from "./components/Microscope";
 import { PreferenceArena } from "./components/PreferenceArena";
-import type { Bootstrap, FactoryRunSummary, RunSummary, Tab } from "./types";
+import type { Bootstrap, RunSummary, Tab } from "./types";
 
 function App() {
   const [tab, setTab] = useState<Tab>("factory");
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
   const [history, setHistory] = useState<RunSummary[]>([]);
   const [error, setError] = useState("");
-  const [factoryRun, setFactoryRun] = useState<FactoryRunSummary | null>(null);
+  const activity = useActivity();
 
   useEffect(() => {
     api.bootstrap()
       .then((data) => {
         setBootstrap(data);
         setHistory(data.history);
-        setFactoryRun(data.factory.history[0] ?? null);
       })
       .catch((caught) =>
         setError(caught instanceof Error ? caught.message : "서버에 연결하지 못했습니다."),
@@ -50,6 +52,16 @@ function App() {
     );
   }
 
+  const factoryRun =
+    activity.factory.run ?? bootstrap.factory.history[0] ?? null;
+  const activityItems = activity.active.map((item) => ({
+    ...item,
+    connection:
+      item.track === "factory"
+        ? activity.factory.connection
+        : activity.microscope.connection,
+  }));
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -73,8 +85,37 @@ function App() {
           <small>parameters</small>
         </div>
       </header>
-      {tab === "factory" && <Factory bootstrap={bootstrap} run={factoryRun} onRunChange={setFactoryRun} />}
-      {tab === "microscope" && <Microscope bootstrap={bootstrap} onRunFinished={recordRun} />}
+      <ActivityBar items={activityItems} onNavigate={setTab} />
+      {activity.notice && (
+        <div className={`app-toast ${activity.notice.failed ? "failed" : ""}`}>
+          {activity.notice.message}
+        </div>
+      )}
+      {tab === "factory" && (
+        <Factory
+          bootstrap={bootstrap}
+          run={factoryRun}
+          isLive={Boolean(
+            activity.factory.run &&
+              activity.factory.run.id === factoryRun?.id &&
+              isActiveRun(activity.factory.run),
+          )}
+          connection={activity.factory.connection}
+          telemetry={activity.factory.telemetry}
+          events={activity.factory.events}
+          onRunChange={activity.factory.adopt}
+        />
+      )}
+      {tab === "microscope" && (
+        <Microscope
+          bootstrap={bootstrap}
+          run={activity.microscope.run}
+          connection={activity.microscope.connection}
+          events={activity.microscope.events}
+          onRunChange={activity.microscope.adopt}
+          onRunFinished={recordRun}
+        />
+      )}
       {tab === "alignment" && <AlignmentStudio run={factoryRun} />}
       {tab === "arena" && <PreferenceArena initialVotes={bootstrap.factory.data.user_vote_count} />}
       {tab === "inference" && <InferenceEngine bootstrap={bootstrap} />}

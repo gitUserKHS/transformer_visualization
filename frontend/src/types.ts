@@ -83,6 +83,15 @@ export interface RunSummary {
   sample: string;
   parameter_count: number;
   created_at: number;
+  updated_at?: number;
+  stage?: string;
+  stage_progress?: number;
+  overall_progress?: number;
+  elapsed_seconds?: number;
+  eta_seconds?: number | null;
+  steps_per_second?: number;
+  metric_series?: Array<{ step: number; loss: number; perplexity?: number }>;
+  error_message?: string | null;
 }
 
 export interface Bootstrap {
@@ -208,7 +217,50 @@ export interface FactoryRunSummary {
   comparisons: Record<string, unknown>;
   peak_vram_bytes: number;
   created_at: number;
+  updated_at?: number;
+  stage_states?: Record<
+    string,
+    "pending" | "running" | "completed" | "skipped"
+  >;
+  stage_progress?: number;
+  overall_progress?: number;
+  elapsed_seconds?: number;
+  eta_seconds?: number | null;
+  steps_per_second?: number;
+  metric_series?: Array<{
+    stage: string;
+    step: number;
+    loss: number;
+    timestamp: number;
+  }>;
+  error_message?: string | null;
 }
+
+export interface DeviceTelemetry {
+  available?: boolean;
+  source?: string;
+  utilization_percent?: number;
+  memory_used_bytes?: number;
+  memory_total_bytes?: number;
+  temperature_c?: number;
+  power_w?: number;
+  torch_allocated_bytes?: number;
+  torch_reserved_bytes?: number;
+  device?: string;
+}
+
+export interface ActivityResponse {
+  server_time: number;
+  factory: FactoryRunSummary | null;
+  microscope: RunSummary | null;
+}
+
+export type ConnectionState =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "stale";
 
 export interface NeuralTensorStats {
   name: string;

@@ -1,5 +1,7 @@
 import platform
 import subprocess
+import threading
+import time
 
 import torch
 
@@ -8,6 +10,57 @@ GPU_SETUP_COMMAND = (
     ".\\setup_gpu.ps1; .\\.venv-gpu\\Scripts\\python.exe "
     "-m uvicorn backend.app.main:app --reload"
 )
+
+_telemetry_lock = threading.Lock()
+_telemetry_cache: tuple[float, dict] = (0.0, {})
+
+
+def gpu_telemetry() -> dict:
+    global _telemetry_cache
+    now = time.time()
+    with _telemetry_lock:
+        if now - _telemetry_cache[0] < 0.75:
+            return _telemetry_cache[1]
+
+        telemetry: dict = {"available": torch.cuda.is_available()}
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,memory.used,memory.total,"
+                    "temperature.gpu,power.draw",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            values = [value.strip() for value in result.stdout.strip().split(",")]
+            if len(values) == 5:
+                telemetry.update(
+                    {
+                        "source": "nvidia-smi",
+                        "utilization_percent": float(values[0]),
+                        "memory_used_bytes": int(float(values[1]) * 1024**2),
+                        "memory_total_bytes": int(float(values[2]) * 1024**2),
+                        "temperature_c": float(values[3]),
+                        "power_w": float(values[4]),
+                    }
+                )
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info(0)
+            telemetry.setdefault("source", "pytorch")
+            telemetry.setdefault("memory_total_bytes", total)
+            telemetry.setdefault("memory_used_bytes", total - free)
+            telemetry["torch_allocated_bytes"] = torch.cuda.memory_allocated()
+            telemetry["torch_reserved_bytes"] = torch.cuda.memory_reserved()
+
+        _telemetry_cache = (now, telemetry)
+        return telemetry
 
 
 def system_diagnostics() -> dict:
@@ -66,4 +119,3 @@ def system_diagnostics() -> dict:
             else "NVIDIA GPU는 감지됐지만 현재 PyTorch가 CPU 빌드입니다."
         ),
     }
-

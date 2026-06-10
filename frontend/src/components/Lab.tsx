@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, openRunSocket } from "../api";
+import { api } from "../api";
+import { formatDuration, isActiveRun, statusLabel } from "../activity";
 import type {
   Bootstrap,
+  ConnectionState,
   Generation,
-  Metrics,
   RunSummary,
   Trace,
   TrainingConfig,
@@ -35,27 +36,22 @@ function defaultConfig(bootstrap: Bootstrap): TrainingConfig {
   };
 }
 
-function statusLabel(status?: string) {
-  return {
-    running: "학습 중",
-    paused: "일시정지",
-    stopping: "정지 중",
-    stopped: "정지됨",
-    completed: "완료",
-    failed: "오류",
-  }[status ?? ""] ?? "준비";
-}
-
 export function Lab({
   bootstrap,
+  run,
+  connection,
+  events,
+  onRunChange,
   onRunFinished,
 }: {
   bootstrap: Bootstrap;
+  run: RunSummary | null;
+  connection: ConnectionState;
+  events: Array<Record<string, unknown>>;
+  onRunChange: (run: RunSummary | null) => void;
   onRunFinished: (run: RunSummary) => void;
 }) {
   const [config, setConfig] = useState(() => defaultConfig(bootstrap));
-  const [run, setRun] = useState<RunSummary | null>(null);
-  const [metrics, setMetrics] = useState<Partial<Metrics>>({});
   const [trace, setTrace] = useState<Trace | null>(null);
   const [advanced, setAdvanced] = useState(false);
   const [activePanel, setActivePanel] = useState<"attention" | "vectors" | "logits">("attention");
@@ -68,9 +64,28 @@ export function Lab({
   const [selectedToken, setSelectedToken] = useState(-1);
   const [generation, setGeneration] = useState<Generation | null>(null);
   const [generating, setGenerating] = useState(false);
-  const socketRef = useRef<WebSocket | null>(null);
+  const finishedRef = useRef<string | null>(null);
+  const live = isActiveRun(run);
 
-  useEffect(() => () => socketRef.current?.close(), []);
+  useEffect(() => {
+    if (live && run) setConfig(run.config);
+  }, [live, run?.id]);
+
+  useEffect(() => {
+    const event = [...events].reverse().find((item) => item.trace);
+    if (event?.trace) setTrace(event.trace as Trace);
+  }, [events]);
+
+  useEffect(() => {
+    if (
+      run &&
+      ["completed", "stopped", "failed"].includes(run.status) &&
+      finishedRef.current !== run.id
+    ) {
+      finishedRef.current = run.id;
+      onRunFinished(run);
+    }
+  }, [onRunFinished, run]);
 
   const selectPreset = (key: string) => {
     const preset = bootstrap.presets[key];
@@ -85,37 +100,11 @@ export function Lab({
 
   const startRun = async () => {
     setError("");
-    socketRef.current?.close();
     try {
       const created = await api.createRun(config);
-      setRun(created);
-      setMetrics({});
+      onRunChange(created);
+      finishedRef.current = null;
       setTrace(null);
-      const socket = openRunSocket(created.id, (event) => {
-        if (event.type === "metrics") {
-          const nextMetrics = event.metrics as Metrics;
-          const summary = event.summary as RunSummary;
-          setMetrics(nextMetrics);
-          setRun(summary);
-          if (event.trace) setTrace(event.trace as Trace);
-        }
-        if (event.type === "sample") {
-          setRun((current) => current ? { ...current, sample: event.text as string } : current);
-        }
-        if (event.type === "status") {
-          const summary = event.summary as RunSummary | undefined;
-          if (summary) {
-            setRun(summary);
-            if (["completed", "stopped"].includes(summary.status)) onRunFinished(summary);
-          } else {
-            setRun((current) =>
-              current ? { ...current, status: event.status as string } : current,
-            );
-          }
-        }
-        if (event.type === "error") setError(event.message as string);
-      });
-      socketRef.current = socket;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "학습을 시작하지 못했습니다.");
     }
@@ -124,7 +113,7 @@ export function Lab({
   const control = async (action: string) => {
     if (!run) return;
     try {
-      setRun(await api.controlRun(run.id, action));
+      onRunChange(await api.controlRun(run.id, action));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "제어 요청에 실패했습니다.");
     }
@@ -171,8 +160,13 @@ export function Lab({
     }
   };
 
-  const lossPoints = run?.losses ?? [];
-  const progress = run ? Math.min(100, (run.step / run.total_steps) * 100) : 0;
+  const metrics = run?.last_metrics ?? {};
+  const lossPoints = run?.metric_series ?? run?.losses ?? [];
+  const progress = Math.min(
+    100,
+    (run?.overall_progress ??
+      (run ? run.step / Math.max(1, run.total_steps) : 0)) * 100,
+  );
   const selectedAttention = trace?.attention;
   const probabilities = useMemo(
     () => trace?.top_logits ?? [],
@@ -190,6 +184,7 @@ export function Lab({
         <label className="field">
           <span>실험 이름</span>
           <input
+            disabled={live}
             value={config.name}
             maxLength={50}
             onChange={(event) => setConfig({ ...config, name: event.target.value })}
@@ -202,6 +197,7 @@ export function Lab({
             {Object.entries(bootstrap.presets).map(([key, preset]) => (
               <button
                 key={key}
+                disabled={live}
                 className={config.preset === key ? "active" : ""}
                 onClick={() => selectPreset(key)}
               >
@@ -216,6 +212,7 @@ export function Lab({
           <label className="field">
             <span>Steps</span>
             <input
+              disabled={live}
               type="number"
               min={1}
               max={3000}
@@ -226,6 +223,7 @@ export function Lab({
           <label className="field">
             <span>Batch</span>
             <input
+              disabled={live}
               type="number"
               min={1}
               max={64}
@@ -239,6 +237,7 @@ export function Lab({
         <label className="field">
           <span>Learning rate <b>{config.learning_rate}</b></span>
           <input
+            disabled={live}
             type="range"
             min={0.00005}
             max={0.001}
@@ -250,7 +249,7 @@ export function Lab({
           />
         </label>
 
-        <button className="advanced-toggle" onClick={() => setAdvanced(!advanced)}>
+        <button disabled={live} className="advanced-toggle" onClick={() => setAdvanced(!advanced)}>
           <span>심화 설정</span><b>{advanced ? "−" : "+"}</b>
         </button>
         {advanced && (
@@ -258,6 +257,7 @@ export function Lab({
             <div className="two-fields">
               <label className="field"><span>레이어</span>
                 <select
+                  disabled={live}
                   value={config.model.n_layers}
                   onChange={(event) =>
                     setConfig({
@@ -271,6 +271,7 @@ export function Lab({
               </label>
               <label className="field"><span>헤드</span>
                 <select
+                  disabled={live}
                   value={config.model.n_heads}
                   onChange={(event) =>
                     setConfig({
@@ -286,6 +287,7 @@ export function Lab({
             <div className="two-fields">
               <label className="field"><span>d_model</span>
                 <select
+                  disabled={live}
                   value={config.model.d_model}
                   onChange={(event) =>
                     setConfig({
@@ -299,6 +301,7 @@ export function Lab({
               </label>
               <label className="field"><span>d_ff</span>
                 <select
+                  disabled={live}
                   value={config.model.d_ff}
                   onChange={(event) =>
                     setConfig({
@@ -315,12 +318,12 @@ export function Lab({
         )}
 
         <div className="run-controls">
-          {!run || ["completed", "stopped", "failed"].includes(run.status) ? (
+          {!live ? (
             <button className="primary-button wide" onClick={startRun}>학습 시작</button>
           ) : (
             <>
-              <button className="primary-button" onClick={() => control(run.status === "paused" ? "resume" : "pause")}>
-                {run.status === "paused" ? "계속" : "일시정지"}
+              <button className="primary-button" onClick={() => control(run?.status === "paused" ? "resume" : "pause")}>
+                {run?.status === "paused" ? "계속" : "일시정지"}
               </button>
               <button className="ghost-button" onClick={() => control("step")}>1 step</button>
               <button className="danger-button" onClick={() => control("stop")}>정지</button>
@@ -331,6 +334,25 @@ export function Lab({
           <div><span>{run?.step ?? 0} / {run?.total_steps ?? config.steps} steps</span><b>{progress.toFixed(0)}%</b></div>
           <div className="progress-track"><i style={{ width: `${progress}%` }} /></div>
         </div>
+        <div className={`connection-strip ${connection}`}>
+          <i />
+          <span>
+            {live
+              ? connection === "connected"
+                ? "실시간 연결"
+                : connection === "stale"
+                  ? "상태 확인 필요"
+                  : "재연결 중"
+              : run
+                ? "최근 실행 결과"
+                : "실행 대기"}
+          </span>
+          <small>
+            {run?.updated_at
+              ? new Date(run.updated_at * 1000).toLocaleTimeString("ko-KR")
+              : "—"}
+          </small>
+        </div>
         <div className="model-spec">
           <span>현재 모델</span>
           <strong>{(run?.parameter_count ?? bootstrap.model.parameter_count).toLocaleString()} params</strong>
@@ -339,7 +361,19 @@ export function Lab({
       </aside>
 
       <section className="lab-main">
-        {error && <div className="error-banner">{error}</div>}
+        {(error || run?.error_message) && (
+          <div className="error-banner">{error || run?.error_message}</div>
+        )}
+        <section className="panel microscope-operations">
+          <div>
+            <span>{live ? "실시간 실행" : run ? "최근 실행" : "대기"}</span>
+            <strong>{statusLabel(run?.status)}</strong>
+          </div>
+          <div><span>진행률</span><strong>{progress.toFixed(0)}%</strong></div>
+          <div><span>경과 시간</span><strong>{formatDuration(run?.elapsed_seconds)}</strong></div>
+          <div><span>남은 시간</span><strong>{formatDuration(run?.eta_seconds)}</strong></div>
+          <div><span>처리 속도</span><strong>{run?.steps_per_second ? `${run.steps_per_second.toFixed(2)} step/s` : "계산 중"}</strong></div>
+        </section>
         <div className="metrics-grid">
           <MetricCard label="Cross Entropy" value={metrics.loss?.toFixed(4) ?? "—"} detail="낮을수록 정답에 가까워요" tone="coral" />
           <MetricCard label="Perplexity" value={metrics.perplexity?.toFixed(2) ?? "—"} detail="모델이 고민하는 후보 수" tone="gold" />

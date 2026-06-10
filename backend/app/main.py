@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -19,7 +20,7 @@ from .schemas import (
     ScaleEstimateRequest,
     TrainingConfig,
 )
-from .system_info import system_diagnostics
+from .system_info import gpu_telemetry, system_diagnostics
 
 
 app = FastAPI(
@@ -57,9 +58,23 @@ def system() -> dict:
     return system_diagnostics()
 
 
+@app.get("/api/activity")
+def activity() -> dict:
+    microscope = manager.active_run()
+    factory_run = factory.active_run()
+    return {
+        "server_time": time.time(),
+        "microscope": microscope.summary() if microscope else None,
+        "factory": factory_run.summary() if factory_run else None,
+    }
+
+
 @app.post("/api/runs", status_code=201)
 def create_run(config: TrainingConfig) -> dict:
-    return manager.create_run(config)
+    try:
+        return manager.create_run(config)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/runs/{run_id}")
@@ -151,20 +166,41 @@ def estimate_scale(request: ScaleEstimateRequest) -> dict:
 @app.websocket("/ws/runs/{run_id}")
 async def run_events(websocket: WebSocket, run_id: str) -> None:
     await websocket.accept()
-    last_index = -1
+    try:
+        last_index = int(websocket.query_params.get("after", "-1"))
+    except ValueError:
+        last_index = -1
+    last_heartbeat = 0.0
     try:
         while True:
             try:
                 events = manager.events_after(run_id, last_index)
             except KeyError:
                 await websocket.send_json(
-                    {"type": "error", "message": "실행을 찾을 수 없습니다."}
+                    {
+                        "type": "error",
+                        "reason": "not_found",
+                        "message": "실행을 찾을 수 없습니다.",
+                    }
                 )
                 await websocket.close(code=4404)
                 return
             for event in events:
                 await websocket.send_json(event)
                 last_index = event["index"]
+            now = time.time()
+            if now - last_heartbeat >= 1.0:
+                state = manager.get_run(run_id)
+                await websocket.send_json(
+                    {
+                        "type": "heartbeat",
+                        "run_id": run_id,
+                        "timestamp": now,
+                        "summary": state.summary(),
+                        "telemetry": {"device": "cpu"},
+                    }
+                )
+                last_heartbeat = now
             state = manager.get_run(run_id)
             if state.status in {"completed", "stopped", "failed"} and not events:
                 await asyncio.sleep(0.2)
@@ -177,20 +213,41 @@ async def run_events(websocket: WebSocket, run_id: str) -> None:
 @app.websocket("/ws/factory/{run_id}")
 async def factory_events(websocket: WebSocket, run_id: str) -> None:
     await websocket.accept()
-    last_index = -1
+    try:
+        last_index = int(websocket.query_params.get("after", "-1"))
+    except ValueError:
+        last_index = -1
+    last_heartbeat = 0.0
     try:
         while True:
             try:
                 events = factory.events_after(run_id, last_index)
             except KeyError:
                 await websocket.send_json(
-                    {"type": "error", "message": "모델 공장 실행을 찾을 수 없습니다."}
+                    {
+                        "type": "error",
+                        "reason": "not_found",
+                        "message": "모델 공장 실행을 찾을 수 없습니다.",
+                    }
                 )
                 await websocket.close(code=4404)
                 return
             for event in events:
                 await websocket.send_json(event)
                 last_index = event["index"]
+            now = time.time()
+            if now - last_heartbeat >= 1.0:
+                state = factory.get_run(run_id)
+                await websocket.send_json(
+                    {
+                        "type": "heartbeat",
+                        "run_id": run_id,
+                        "timestamp": now,
+                        "summary": state.summary(),
+                        "telemetry": gpu_telemetry(),
+                    }
+                )
+                last_heartbeat = now
             await asyncio.sleep(0.08)
     except WebSocketDisconnect:
         return

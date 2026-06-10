@@ -1,16 +1,32 @@
-import { useState } from "react";
-import type { Bootstrap, RunSummary } from "../types";
+import { useEffect, useState } from "react";
+import { isActiveRun } from "../activity";
+import type {
+  Bootstrap,
+  ConnectionState,
+  RunSummary,
+} from "../types";
 import { Guide } from "./Guide";
 import { Lab } from "./Lab";
 
 export function Microscope({
   bootstrap,
+  run,
+  connection,
+  events,
+  onRunChange,
   onRunFinished,
 }: {
   bootstrap: Bootstrap;
+  run: RunSummary | null;
+  connection: ConnectionState;
+  events: Array<Record<string, unknown>>;
+  onRunChange: (run: RunSummary | null) => void;
   onRunFinished: (run: RunSummary) => void;
 }) {
   const [mode, setMode] = useState<"guide" | "lab">("guide");
+  useEffect(() => {
+    if (isActiveRun(run)) setMode("lab");
+  }, [run?.id, run?.status]);
   return (
     <div>
       <div className="subnav">
@@ -25,9 +41,15 @@ export function Microscope({
       {mode === "guide" ? (
         <Guide bootstrap={bootstrap} onOpenLab={() => setMode("lab")} />
       ) : (
-        <Lab bootstrap={bootstrap} onRunFinished={onRunFinished} />
+        <Lab
+          bootstrap={bootstrap}
+          run={run}
+          connection={connection}
+          events={events}
+          onRunChange={onRunChange}
+          onRunFinished={onRunFinished}
+        />
       )}
     </div>
   );
 }
-

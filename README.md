@@ -31,6 +31,7 @@
 ## 화면
 
 - **모델 공장**: 데이터 정제부터 양자화까지 단계별 또는 자동 실행
+- **실시간 관제바**: 모든 탭에서 현재 단계·진행률·ETA를 표시하고 새로고침 후 자동 재연결
 - **뉴럴넷 관측실**: activation 흐름, 레이어별 역전파, AdamW 파라미터 이동,
   실제 5×5 local loss landscape
 - **학습 현미경**: 기존 가이드 학습과 자유 실험실
@@ -120,6 +121,7 @@ masking, reward pair loss, PPO clipping, DPO, GRPO, 사용자 투표, 양자화,
 
 ## 주요 API
 
+- `GET /api/activity`
 - `GET /api/system`
 - `POST /api/factory/runs`
 - `POST /api/factory/runs/{id}/control`

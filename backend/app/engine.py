@@ -60,14 +60,31 @@ class RunState:
     event_counter: int = 0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    paused_at: float | None = None
+    paused_seconds: float = 0.0
     last_metrics: dict = field(default_factory=dict)
     sample: str = ""
+    error_message: str | None = None
     one_step: bool = False
     stop_requested: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
     worker: threading.Thread | None = None
 
+    def elapsed_seconds(self) -> float:
+        end = (
+            self.updated_at
+            if self.status in {"completed", "failed", "stopped"}
+            else self.paused_at
+            if self.paused_at is not None
+            else time.time()
+        )
+        return max(0.0, end - self.created_at - self.paused_seconds)
+
     def summary(self) -> dict:
+        elapsed = self.elapsed_seconds()
+        speed = self.step / elapsed if elapsed > 0 and self.step else 0.0
+        remaining = max(0, self.config.steps - self.step)
+        eta = remaining / speed if speed > 0 else None
         return {
             "id": self.id,
             "name": self.config.name,
@@ -81,6 +98,14 @@ class RunState:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "parameter_count": self.model.parameter_count,
+            "stage": "training",
+            "stage_progress": self.step / max(1, self.config.steps),
+            "overall_progress": self.step / max(1, self.config.steps),
+            "elapsed_seconds": elapsed,
+            "eta_seconds": eta,
+            "steps_per_second": speed,
+            "metric_series": self.losses[-500:],
+            "error_message": self.error_message,
         }
 
 
@@ -122,6 +147,9 @@ class TrainingManager:
         )
 
     def create_run(self, config: TrainingConfig) -> dict:
+        with self._runs_lock:
+            if self.active_run() is not None:
+                raise RuntimeError("학습 현미경에서 이미 학습이 진행 중입니다.")
         torch.manual_seed(config.seed)
         model = VisualGPT(config.model)
         optimizer = torch.optim.AdamW(
@@ -146,6 +174,8 @@ class TrainingManager:
         )
         state.worker = worker
         with self._runs_lock:
+            if self.active_run() is not None:
+                raise RuntimeError("학습 현미경에서 이미 학습이 진행 중입니다.")
             self.runs[run_id] = state
         worker.start()
         return state.summary()
@@ -168,7 +198,6 @@ class TrainingManager:
                 state.events = state.events[-1000:]
 
     def _train_worker(self, state: RunState) -> None:
-        started = time.perf_counter()
         try:
             while state.step < state.config.steps and not state.stop_requested:
                 if state.status == "paused":
@@ -177,7 +206,7 @@ class TrainingManager:
                 metrics = self._train_step(state)
                 state.step += 1
                 state.updated_at = time.time()
-                elapsed = max(time.perf_counter() - started, 1e-6)
+                elapsed = max(state.elapsed_seconds(), 1e-6)
                 metrics["steps_per_second"] = state.step / elapsed
                 metrics["step"] = state.step
                 state.last_metrics = metrics
@@ -206,6 +235,8 @@ class TrainingManager:
                 if state.one_step:
                     state.one_step = False
                     state.status = "paused"
+                    state.paused_at = time.time()
+                    state.updated_at = state.paused_at
                     self._emit(state, "status", {"status": "paused"})
             if state.stop_requested:
                 state.status = "stopped"
@@ -214,7 +245,8 @@ class TrainingManager:
             self._finalize_run(state)
         except Exception as exc:
             state.status = "failed"
-            state.last_metrics["error"] = str(exc)
+            state.error_message = str(exc)
+            state.last_metrics["error"] = state.error_message
             self._emit(state, "error", {"message": str(exc)})
             self._finalize_run(state, save_checkpoint=False)
 
@@ -285,18 +317,35 @@ class TrainingManager:
 
     def control(self, run_id: str, action: str) -> dict:
         state = self.get_run(run_id)
+        now = time.time()
         if action == "pause" and state.status == "running":
             state.status = "paused"
+            state.paused_at = now
         elif action == "resume" and state.status == "paused":
+            if state.paused_at is not None:
+                state.paused_seconds += now - state.paused_at
+            state.paused_at = None
             state.status = "running"
         elif action == "step" and state.status in {"paused", "running"}:
+            if state.paused_at is not None:
+                state.paused_seconds += now - state.paused_at
+            state.paused_at = None
             state.one_step = True
             state.status = "running"
         elif action == "stop" and state.status in {"running", "paused"}:
             state.stop_requested = True
             state.status = "stopping"
+        state.updated_at = now
         self._emit(state, "status", {"status": state.status})
         return state.summary()
+
+    def active_run(self) -> RunState | None:
+        active = [
+            run
+            for run in self.runs.values()
+            if run.status not in {"completed", "failed", "stopped"}
+        ]
+        return max(active, key=lambda run: run.created_at) if active else None
 
     def get_run(self, run_id: str) -> RunState:
         try:
@@ -310,6 +359,10 @@ class TrainingManager:
             return [event for event in state.events if event["index"] > index]
 
     def _finalize_run(self, state: RunState, save_checkpoint: bool = True) -> None:
+        if state.paused_at is not None:
+            state.paused_seconds += time.time() - state.paused_at
+            state.paused_at = None
+        state.updated_at = time.time()
         if save_checkpoint:
             torch.save(
                 {

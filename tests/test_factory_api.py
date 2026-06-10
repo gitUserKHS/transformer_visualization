@@ -14,6 +14,9 @@ def test_system_and_factory_bootstrap_contracts():
     assert bootstrap["factory"]["model"]["parameter_count"] > 15_000_000
     assert bootstrap["factory"]["model"]["n_kv_heads"] == 2
     assert bootstrap["factory"]["data"]["sft_count"] == 1200
+    activity = client.get("/api/activity")
+    assert activity.status_code == 200
+    assert {"server_time", "factory", "microscope"} <= activity.json().keys()
 
 
 def test_scale_estimator_and_cuda_guard():
@@ -35,4 +38,3 @@ def test_scale_estimator_and_cuda_guard():
         blocked = client.post("/api/factory/runs", json={})
         assert blocked.status_code == 409
         assert "CUDA" in blocked.json()["detail"]
-

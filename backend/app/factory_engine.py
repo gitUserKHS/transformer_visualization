@@ -41,6 +41,17 @@ from .system_info import system_diagnostics
 
 FACTORY_DIR = ROOT / "backend" / "artifacts" / "factory"
 FACTORY_HISTORY = FACTORY_DIR / "history.json"
+FACTORY_STAGES = [
+    "data",
+    "pretrain",
+    "sft",
+    "reward",
+    "dpo",
+    "ppo",
+    "grpo",
+    "evaluate",
+    "quantize",
+]
 
 
 @dataclass
@@ -58,13 +69,56 @@ class FactoryRunState:
     comparisons: dict = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     peak_vram_bytes: int = 0
+    updated_at: float = field(default_factory=time.time)
+    paused_at: float | None = None
+    paused_seconds: float = 0.0
+    stage_totals: dict[str, int] = field(default_factory=dict)
+    completed_stages: set[str] = field(default_factory=set)
+    metric_series: list[dict] = field(default_factory=list)
+    error_message: str | None = None
     paused: bool = False
     stop_requested: bool = False
     one_step: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
     worker: threading.Thread | None = None
 
+    def elapsed_seconds(self) -> float:
+        end = (
+            self.updated_at
+            if self.status in {"completed", "failed", "stopped"}
+            else self.paused_at
+            if self.paused_at is not None
+            else time.time()
+        )
+        return max(0.0, end - self.created_at - self.paused_seconds)
+
     def summary(self) -> dict:
+        selected = set(self.config.stages)
+        stage_states = {
+            stage: (
+                "skipped"
+                if stage not in selected
+                else "completed"
+                if stage in self.completed_stages
+                else "running"
+                if stage == self.stage
+                and self.status in {"running", "paused", "stopping"}
+                else "pending"
+            )
+            for stage in FACTORY_STAGES
+        }
+        selected_total = sum(self.stage_totals.get(stage, 1) for stage in selected)
+        completed_steps = sum(
+            self.stage_totals.get(stage, 1) for stage in self.completed_stages
+        )
+        if self.stage in selected and self.stage not in self.completed_stages:
+            completed_steps += min(
+                self.stage_step, self.stage_totals.get(self.stage, self.stage_total or 1)
+            )
+        overall_progress = completed_steps / max(1, selected_total)
+        elapsed = self.elapsed_seconds()
+        speed = completed_steps / elapsed if elapsed > 0 and completed_steps else 0.0
+        eta = (selected_total - completed_steps) / speed if speed > 0 else None
         return {
             "id": self.id,
             "name": self.config.name,
@@ -78,6 +132,15 @@ class FactoryRunState:
             "comparisons": self.comparisons,
             "peak_vram_bytes": self.peak_vram_bytes,
             "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "stage_states": stage_states,
+            "stage_progress": self.stage_step / max(1, self.stage_total),
+            "overall_progress": min(1.0, overall_progress),
+            "elapsed_seconds": elapsed,
+            "eta_seconds": max(0.0, eta) if eta is not None else None,
+            "steps_per_second": speed,
+            "metric_series": self.metric_series[-500:],
+            "error_message": self.error_message,
         }
 
 
@@ -138,6 +201,7 @@ class FactoryManager:
         return event
 
     def _emit(self, state: FactoryRunState, event_type: str, payload: dict) -> None:
+        state.updated_at = time.time()
         with state.lock:
             state.events.append(self._event(state, event_type, payload))
             state.events = state.events[-2000:]
@@ -149,13 +213,22 @@ class FactoryManager:
                 "상용 모델 공장은 CUDA가 필요합니다. "
                 f"{diagnostics['setup_command']}"
             )
+        with self._lock:
+            if self.active_run() is not None:
+                raise RuntimeError("모델 공장에서 이미 학습이 진행 중입니다.")
         run_id = uuid.uuid4().hex[:10]
-        state = FactoryRunState(id=run_id, config=config)
+        state = FactoryRunState(
+            id=run_id,
+            config=config,
+            stage_totals=self._planned_stage_totals(config),
+        )
         state.events.append(self._event(state, "status", {"status": "running"}))
         state.worker = threading.Thread(
             target=self._worker, args=(state,), daemon=True, name=f"factory-{run_id}"
         )
         with self._lock:
+            if self.active_run() is not None:
+                raise RuntimeError("모델 공장에서 이미 학습이 진행 중입니다.")
             self.runs[run_id] = state
         state.worker.start()
         return state.summary()
@@ -170,19 +243,67 @@ class FactoryManager:
         with state.lock:
             return [event for event in state.events if event["index"] > index]
 
+    def active_run(self) -> FactoryRunState | None:
+        active = [
+            run
+            for run in self.runs.values()
+            if run.status not in {"completed", "failed", "stopped"}
+        ]
+        return max(active, key=lambda run: run.created_at) if active else None
+
+    def _planned_stage_totals(self, config: FactoryRunConfig) -> dict[str, int]:
+        return {
+            "data": len(self.data.cleaning_trace),
+            "pretrain": config.pretrain_steps,
+            "sft": config.sft_steps,
+            "reward": config.reward_steps,
+            "dpo": config.dpo_steps,
+            "ppo": config.ppo_steps,
+            "grpo": config.grpo_steps,
+            "evaluate": 4,
+            "quantize": 3,
+        }
+
+    @staticmethod
+    def _record_metric(
+        state: FactoryRunState, stage: str, metric: dict
+    ) -> None:
+        state.metrics[stage] = metric
+        state.updated_at = time.time()
+        loss = metric.get("loss")
+        if isinstance(loss, (int, float)) and math.isfinite(loss):
+            state.metric_series.append(
+                {
+                    "stage": stage,
+                    "step": int(metric.get("step", state.stage_step)),
+                    "loss": float(loss),
+                    "timestamp": state.updated_at,
+                }
+            )
+            state.metric_series = state.metric_series[-500:]
+
     def control(self, run_id: str, action: str) -> dict:
         state = self.get_run(run_id)
-        if action == "pause":
+        now = time.time()
+        if action == "pause" and state.status == "running":
             state.paused = True
             state.status = "paused"
-        elif action == "resume":
+            if state.paused_at is None:
+                state.paused_at = now
+        elif action == "resume" and state.status == "paused":
+            if state.paused_at is not None:
+                state.paused_seconds += now - state.paused_at
+            state.paused_at = None
             state.paused = False
             state.status = "running"
-        elif action == "step":
+        elif action == "step" and state.status in {"paused", "running"}:
+            if state.paused_at is not None:
+                state.paused_seconds += now - state.paused_at
+            state.paused_at = None
             state.one_step = True
             state.paused = False
             state.status = "running"
-        elif action == "stop":
+        elif action == "stop" and state.status in {"running", "paused"}:
             state.stop_requested = True
             state.status = "stopping"
         self._emit(state, "status", {"status": state.status})
@@ -205,6 +326,8 @@ class FactoryManager:
             state.one_step = False
             state.paused = True
             state.status = "paused"
+            state.paused_at = time.time()
+            state.updated_at = state.paused_at
 
     @staticmethod
     def _autocast():
@@ -221,7 +344,13 @@ class FactoryManager:
             for stage in state.config.stages:
                 self._gate(state)
                 state.stage = stage
-                self._emit(state, "stage", {"stage": stage, "status": "started"})
+                state.stage_step = 0
+                state.stage_total = state.stage_totals.get(stage, 1)
+                self._emit(
+                    state,
+                    "stage",
+                    {"stage": stage, "stage_status": "running"},
+                )
                 method = getattr(self, f"_stage_{stage}")
                 attempted = False
                 while True:
@@ -250,14 +379,24 @@ class FactoryManager:
                                 "gradient_accumulation": state.config.gradient_accumulation,
                             },
                         )
-                self._emit(state, "stage", {"stage": stage, "status": "completed"})
+                state.completed_stages.add(stage)
+                self._emit(
+                    state,
+                    "stage",
+                    {"stage": stage, "stage_status": "completed"},
+                )
             state.status = "completed"
         except InterruptedError:
             state.status = "stopped"
         except Exception as exc:
             state.status = "failed"
+            state.error_message = str(exc)
             self._emit(state, "error", {"message": str(exc)})
         finally:
+            if state.paused_at is not None:
+                state.paused_seconds += time.time() - state.paused_at
+                state.paused_at = None
+            state.updated_at = time.time()
             summary = state.summary()
             self.history = [summary] + [
                 item for item in self.history if item.get("id") != state.id
@@ -614,7 +753,7 @@ class FactoryManager:
                 "perplexity": math.exp(min(mean_loss, 20)),
                 "gradient_norm": float(grad_norm),
             }
-            state.metrics["pretrain"] = metric
+            self._record_metric(state, "pretrain", metric)
             if should_trace and trace_batch is not None:
                 surface = (
                     self._loss_surface(
@@ -721,7 +860,7 @@ class FactoryManager:
                 "response_tokens": int(labels.ne(-100).sum()),
                 "lora": lora,
             }
-            state.metrics["sft"] = metric
+            self._record_metric(state, "sft", metric)
             if should_trace:
                 surface = (
                     self._loss_surface(
@@ -807,7 +946,7 @@ class FactoryManager:
                 "accuracy": float(accuracy.detach()),
                 "user_fraction": sum(item.source == "user" for item in batch) / len(batch),
             }
-            state.metrics["reward"] = metric
+            self._record_metric(state, "reward", metric)
             state.stage_step = step
             if step == 1 or step % 5 == 0:
                 self._emit(state, "reward", metric)
@@ -858,7 +997,7 @@ class FactoryManager:
             loss.backward()
             optimizer.step()
             metric = {"step": step, "loss": float(loss.detach()), **detail}
-            state.metrics["dpo"] = metric
+            self._record_metric(state, "dpo", metric)
             state.stage_step = step
             if step == 1 or step % 5 == 0:
                 self._emit(state, "dpo", metric)
@@ -959,7 +1098,7 @@ class FactoryManager:
                 "response": response,
                 **detail,
             }
-            state.metrics["ppo"] = metric
+            self._record_metric(state, "ppo", metric)
             state.stage_step = step
             self._emit(state, "ppo", metric)
             self._step_done(state)
@@ -1033,7 +1172,7 @@ class FactoryManager:
                 "ranking": ranking,
                 **detail,
             }
-            state.metrics["grpo"] = metric
+            self._record_metric(state, "grpo", metric)
             state.stage_step = step
             self._emit(state, "grpo", metric)
             self._step_done(state)
@@ -1135,15 +1274,5 @@ class FactoryManager:
                 "lora": lora,
             },
             "history": self.history,
-            "stages": [
-                "data",
-                "pretrain",
-                "sft",
-                "reward",
-                "dpo",
-                "ppo",
-                "grpo",
-                "evaluate",
-                "quantize",
-            ],
+            "stages": FACTORY_STAGES,
         }

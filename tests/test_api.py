@@ -83,6 +83,52 @@ def test_websocket_replays_run_events():
         event = websocket.receive_json()
     assert event["type"] == "status"
     assert event["run_id"] == run_id
+    for _ in range(100):
+        summary = client.get(f"/api/runs/{run_id}").json()
+        if summary["status"] in {"completed", "failed", "stopped"}:
+            break
+        time.sleep(0.03)
+
+
+def test_websocket_heartbeat_and_activity_recovery():
+    created = client.post(
+        "/api/runs",
+        json={
+            "name": "heartbeat-test",
+            "preset": "inspect",
+            "steps": 100,
+            "batch_size": 1,
+            "model": {
+                "vocab_size": 2048,
+                "context_length": 8,
+                "d_model": 32,
+                "n_layers": 1,
+                "n_heads": 4,
+                "d_ff": 64,
+                "dropout": 0,
+            },
+        },
+    )
+    assert created.status_code == 201
+    run_id = created.json()["id"]
+    client.post(f"/api/runs/{run_id}/control", json={"action": "pause"})
+
+    active = client.get("/api/activity").json()
+    assert active["microscope"]["id"] == run_id
+    with client.websocket_connect(f"/ws/runs/{run_id}?after=9999") as websocket:
+        heartbeat = websocket.receive_json()
+    assert heartbeat["type"] == "heartbeat"
+    assert heartbeat["summary"]["id"] == run_id
+    assert heartbeat["telemetry"]["device"] == "cpu"
+
+    client.post(f"/api/runs/{run_id}/control", json={"action": "stop"})
+
+
+def test_websocket_marks_missing_runs_without_reconnect_ambiguity():
+    with client.websocket_connect("/ws/runs/missing-run?after=12") as websocket:
+        event = websocket.receive_json()
+    assert event["type"] == "error"
+    assert event["reason"] == "not_found"
 
 
 def test_built_frontend_is_served():

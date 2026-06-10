@@ -1,14 +1,19 @@
 import {
-  type Dispatch,
-  type SetStateAction,
   useEffect,
   useMemo,
-  useRef,
   useState,
 } from "react";
-import { api, openFactorySocket } from "../api";
+import { api } from "../api";
+import {
+  eventDescription,
+  formatDuration,
+  stageLabel,
+  statusLabel,
+} from "../activity";
 import type {
   Bootstrap,
+  ConnectionState,
+  DeviceTelemetry,
   FactoryRunConfig,
   FactoryRunSummary,
   NeuralTrace,
@@ -51,46 +56,32 @@ function defaults(stages: string[]): FactoryRunConfig {
 export function Factory({
   bootstrap,
   run,
+  isLive,
+  connection,
+  telemetry,
+  events,
   onRunChange,
 }: {
   bootstrap: Bootstrap;
   run: FactoryRunSummary | null;
-  onRunChange: Dispatch<SetStateAction<FactoryRunSummary | null>>;
+  isLive: boolean;
+  connection: ConnectionState;
+  telemetry: DeviceTelemetry | null;
+  events: Array<Record<string, unknown>>;
+  onRunChange: (run: FactoryRunSummary | null) => void;
 }) {
   const [config, setConfig] = useState(() => defaults(bootstrap.factory.stages));
   const [error, setError] = useState("");
-  const socket = useRef<WebSocket | null>(null);
-  const [events, setEvents] = useState<Array<Record<string, unknown>>>([]);
 
-  useEffect(() => () => socket.current?.close(), []);
+  useEffect(() => {
+    if (isLive && run) setConfig(run.config);
+  }, [isLive, run?.id]);
 
   const start = async () => {
     setError("");
-    setEvents([]);
     try {
       const created = await api.createFactoryRun(config);
       onRunChange(created);
-      socket.current?.close();
-      socket.current = openFactorySocket(created.id, (event) => {
-        setEvents((current) => [...current.slice(-199), event]);
-        if (event.summary) {
-          onRunChange(event.summary as FactoryRunSummary);
-          return;
-        }
-        onRunChange((current) => {
-          const base = current ?? created;
-          return {
-            ...base,
-            status: (event.status as string) ?? base.status,
-            stage: (event.stage as string) ?? base.stage,
-            stage_step: Number(event.step ?? base.stage_step),
-            metrics: {
-              ...base.metrics,
-              [event.type as string]: event,
-            },
-          };
-        });
-      });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "모델 공장을 시작하지 못했습니다.");
     }
@@ -119,18 +110,35 @@ export function Factory({
 
   const lossPoints = useMemo(
     () =>
-      events
-        .filter((event) => typeof event.loss === "number")
-        .map((event, index) => ({
+      (run?.metric_series ?? []).map((point, index) => ({
           step: index + 1,
-          loss: event.loss as number,
+          loss: point.loss,
         })),
-    [events],
+    [run?.metric_series],
   );
-  const progress =
-    run && run.stage_total ? Math.min(100, (run.stage_step / run.stage_total) * 100) : 0;
+  const stageProgress = Math.min(
+    100,
+    (run?.stage_progress ??
+      (run?.stage_total ? run.stage_step / run.stage_total : 0)) * 100,
+  );
+  const overallProgress = Math.min(100, (run?.overall_progress ?? 0) * 100);
   const neuralTrace =
     (run?.metrics.neural_trace as unknown as NeuralTrace | undefined) ?? null;
+  const currentMetric = (run ? run.metrics[run.stage] : undefined) as
+      | Record<string, unknown>
+      | undefined;
+  const currentLoss =
+    typeof currentMetric?.loss === "number" ? currentMetric.loss : null;
+  const connectionLabel =
+    connection === "connected"
+      ? "실시간 연결"
+      : connection === "stale"
+        ? "상태 확인 필요"
+        : isLive
+          ? "재연결 중"
+          : "기록 보기";
+  const memoryUsed = telemetry?.memory_used_bytes;
+  const memoryTotal = telemetry?.memory_total_bytes;
 
   return (
     <main className="factory-page">
@@ -172,19 +180,39 @@ export function Factory({
           {bootstrap.factory.stages.map((stage, index) => {
             const meta = stageMeta[stage];
             const selected = config.stages.includes(stage);
-            const active =
-              run?.stage === stage &&
-              ["running", "paused"].includes(run.status);
+            const currentStageIndex = bootstrap.factory.stages.indexOf(
+              run?.stage ?? "",
+            );
+            const state =
+              run?.stage_states?.[stage] ??
+              (run?.stage === stage && isLive
+                ? "running"
+                : run?.status === "completed" && selected
+                  ? "completed"
+                  : run && index < currentStageIndex && selected
+                    ? "completed"
+                : selected
+                  ? "pending"
+                  : "skipped");
             return (
               <button
                 key={stage}
-                className={`${selected ? "selected" : ""} ${active ? "running" : ""}`}
+                className={`${selected ? "selected" : ""} stage-${state}`}
                 onClick={() => toggleStage(stage)}
+                disabled={isLive}
               >
                 <small>{String(index + 1).padStart(2, "0")}</small>
                 <strong>{meta[0]}</strong>
                 <span>{meta[1]}</span>
-                <i>{active ? "RUNNING" : selected ? "INCLUDED" : "SKIP"}</i>
+                <i>
+                  {state === "running"
+                    ? "RUNNING"
+                    : state === "completed"
+                      ? "DONE"
+                      : state === "skipped"
+                        ? "SKIP"
+                        : "PENDING"}
+                </i>
               </button>
             );
           })}
@@ -194,7 +222,7 @@ export function Factory({
       <div className="factory-grid">
         <section className="panel factory-settings">
           <div className="section-heading"><div><div className="eyebrow">RUN CONFIG</div><h2>공장 설정</h2></div></div>
-          <label><span>실행 이름</span><input value={config.name} onChange={(event) => setConfig({ ...config, name: event.target.value })} /></label>
+          <label><span>실행 이름</span><input disabled={isLive} value={config.name} onChange={(event) => setConfig({ ...config, name: event.target.value })} /></label>
           <div className="setting-grid">
             {[
               ["pretrain_steps", "Pretrain"],
@@ -204,7 +232,7 @@ export function Factory({
               ["ppo_steps", "PPO"],
               ["grpo_steps", "GRPO"],
             ].map(([key, label]) => (
-              <label key={key}><span>{label} steps</span><input type="number" value={config[key as keyof FactoryRunConfig] as number} onChange={(event) => setConfig({ ...config, [key]: Number(event.target.value) })} /></label>
+              <label key={key}><span>{label} steps</span><input disabled={isLive} type="number" value={config[key as keyof FactoryRunConfig] as number} onChange={(event) => setConfig({ ...config, [key]: Number(event.target.value) })} /></label>
             ))}
           </div>
           <div className="setting-grid advanced-settings">
@@ -219,6 +247,7 @@ export function Factory({
               <label key={String(key)}>
                 <span>{label}</span>
                 <input
+                  disabled={isLive}
                   type="number"
                   min={Number(min)}
                   max={Number(max)}
@@ -239,11 +268,25 @@ export function Factory({
             <div><span>학습 파라미터</span><strong>{bootstrap.factory.model.lora.trainable_percent.toFixed(2)}%</strong></div>
             <div><span>Effective batch</span><strong>{config.micro_batch_size * config.gradient_accumulation}</strong></div>
           </div>
-          {error && <div className="error-banner">{error}</div>}
-          <button className="primary-button wide factory-start" disabled={!config.stages.length} onClick={start}>
-            {bootstrap.system.production_ready ? "모델 공장 실행" : "GPU 진단 확인 후 실행"}
+          {(error || run?.error_message) && (
+            <div className="error-banner">{error || run?.error_message}</div>
+          )}
+          <button
+            className="primary-button wide factory-start"
+            disabled={
+              !config.stages.length ||
+              !bootstrap.system.production_ready ||
+              isLive
+            }
+            onClick={start}
+          >
+            {isLive
+              ? `${stageLabel(run?.stage)} ${statusLabel(run?.status)}`
+              : bootstrap.system.production_ready
+                ? "모델 공장 실행"
+                : "GPU 진단 확인 후 실행"}
           </button>
-          {run && !["completed", "failed", "stopped"].includes(run.status) && (
+          {run && isLive && (
             <div className="factory-controls">
               <button onClick={() => control(run.status === "paused" ? "resume" : "pause")}>
                 {run.status === "paused" ? "재개" : "일시정지"}
@@ -257,23 +300,61 @@ export function Factory({
         <section className="panel factory-live">
           <div className="section-heading">
             <div><div className="eyebrow">LIVE TELEMETRY</div><h2>{run ? stageMeta[run.stage]?.[0] ?? run.stage : "공장 대기 중"}</h2></div>
-            <span className={`live-status ${run?.status ?? "ready"}`}>{run?.status ?? "ready"}</span>
+            <div className="live-heading-meta">
+              <span className={isLive ? "real-badge" : "history-badge"}>
+                {isLive ? "실시간 실행" : run ? "최근 완료 실행" : "대기"}
+              </span>
+              <span className={`live-status ${run?.status ?? "ready"}`}>
+                {statusLabel(run?.status)}
+              </span>
+            </div>
           </div>
-          <div className="factory-progress"><i style={{ width: `${progress}%` }} /></div>
-          <div className="factory-metrics">
+          <div className={`connection-strip ${connection}`}>
+            <i />
+            <span>{connectionLabel}</span>
+            <small>
+              마지막 갱신{" "}
+              {run?.updated_at
+                ? new Date(run.updated_at * 1000).toLocaleTimeString("ko-KR")
+                : "—"}
+            </small>
+          </div>
+          <div className="progress-caption">
+            <span>전체 공정</span><b>{overallProgress.toFixed(0)}%</b>
+          </div>
+          <div className="factory-progress overall"><i style={{ width: `${overallProgress}%` }} /></div>
+          <div className="progress-caption">
+            <span>{stageLabel(run?.stage)} 단계</span><b>{stageProgress.toFixed(0)}%</b>
+          </div>
+          <div className="factory-progress"><i style={{ width: `${stageProgress}%` }} /></div>
+          <div className="factory-metrics operations">
             <div><span>Stage step</span><strong>{run?.stage_step ?? 0} / {run?.stage_total ?? 0}</strong></div>
-            <div><span>Peak VRAM</span><strong>{run ? `${(run.peak_vram_bytes / 1024 ** 3).toFixed(2)} GB` : "—"}</strong></div>
+            <div><span>현재 loss</span><strong>{currentLoss?.toFixed(4) ?? "—"}</strong></div>
+            <div><span>처리 속도</span><strong>{run?.steps_per_second ? `${run.steps_per_second.toFixed(2)} step/s` : "계산 중"}</strong></div>
+            <div><span>경과 시간</span><strong>{formatDuration(run?.elapsed_seconds)}</strong></div>
+            <div><span>남은 시간</span><strong>{formatDuration(run?.eta_seconds)}</strong></div>
             <div><span>Checkpoints</span><strong>{Object.keys(run?.checkpoints ?? {}).length}</strong></div>
+          </div>
+          <div className="gpu-telemetry-grid">
+            <div><span>GPU 사용률</span><strong>{telemetry?.utilization_percent !== undefined ? `${telemetry.utilization_percent.toFixed(0)}%` : "—"}</strong></div>
+            <div><span>VRAM</span><strong>{memoryUsed !== undefined && memoryTotal ? `${(memoryUsed / 1024 ** 3).toFixed(2)} / ${(memoryTotal / 1024 ** 3).toFixed(1)} GB` : run ? `${(run.peak_vram_bytes / 1024 ** 3).toFixed(2)} GB peak` : "—"}</strong></div>
+            <div><span>온도</span><strong>{telemetry?.temperature_c !== undefined ? `${telemetry.temperature_c.toFixed(0)}°C` : "—"}</strong></div>
+            <div><span>전력</span><strong>{telemetry?.power_w !== undefined ? `${telemetry.power_w.toFixed(0)} W` : "—"}</strong></div>
           </div>
           <LossChart points={lossPoints} />
           <div className="event-stream">
             {events.slice(-5).reverse().map((event, index) => (
               <div key={`${event.timestamp}-${index}`}>
+                <time>
+                  {typeof event.timestamp === "number"
+                    ? new Date(event.timestamp * 1000).toLocaleTimeString("ko-KR")
+                    : "—"}
+                </time>
                 <code>{String(event.type).toUpperCase()}</code>
-                <span>{typeof event.loss === "number" ? `loss ${(event.loss as number).toFixed(4)}` : String(event.status ?? event.stage ?? "event")}</span>
+                <span>{eventDescription(event)}</span>
               </div>
             ))}
-            {!events.length && <p>실행하면 단계별 tensor와 학습 지표가 여기에 도착해요.</p>}
+            {!events.length && <p>{isLive ? "실시간 이벤트를 기다리고 있어요." : "새 실행을 시작하면 단계별 이벤트가 여기에 표시돼요."}</p>}
           </div>
         </section>
       </div>

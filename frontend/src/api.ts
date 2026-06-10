@@ -1,5 +1,6 @@
 import type {
   Bootstrap,
+  ActivityResponse,
   FactoryRunConfig,
   FactoryRunSummary,
   Generation,
@@ -23,6 +24,7 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   bootstrap: () => request<Bootstrap>("/api/bootstrap"),
+  activity: () => request<ActivityResponse>("/api/activity"),
   createRun: (config: TrainingConfig) =>
     request<RunSummary>("/api/runs", {
       method: "POST",
@@ -93,22 +95,34 @@ export const api = {
 
 export function openRunSocket(
   runId: string,
+  after: number,
   onMessage: (event: Record<string, unknown>) => void,
+  onOpen?: () => void,
+  onClose?: () => void,
 ): WebSocket {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(`${protocol}//${window.location.host}/ws/runs/${runId}`);
+  const socket = new WebSocket(
+    `${protocol}//${window.location.host}/ws/runs/${runId}?after=${after}`,
+  );
   socket.onmessage = (event) => onMessage(JSON.parse(event.data));
+  socket.onopen = () => onOpen?.();
+  socket.onclose = () => onClose?.();
   return socket;
 }
 
 export function openFactorySocket(
   runId: string,
+  after: number,
   onMessage: (event: Record<string, unknown>) => void,
+  onOpen?: () => void,
+  onClose?: () => void,
 ): WebSocket {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(
-    `${protocol}//${window.location.host}/ws/factory/${runId}`,
+    `${protocol}//${window.location.host}/ws/factory/${runId}?after=${after}`,
   );
   socket.onmessage = (event) => onMessage(JSON.parse(event.data));
+  socket.onopen = () => onOpen?.();
+  socket.onclose = () => onClose?.();
   return socket;
 }
