@@ -8,6 +8,7 @@ set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" (
     echo.
     echo Transformer Learning Studio failed to start. Exit code: %EXIT_CODE%
+    echo See "%~dp0startup.log" for details.
     pause
 )
 

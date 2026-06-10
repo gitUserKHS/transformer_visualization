@@ -43,21 +43,27 @@
 
 ## GPU 설치와 실행
 
-Windows, NVIDIA GPU, 최신 드라이버, Node.js 20 이상이 필요합니다.
+Windows에서 `start.bat`을 더블클릭하면 됩니다. 첫 실행에는 Node.js 20 이상,
+Python 3.11 이상과 최신 NVIDIA 드라이버가 필요합니다.
 
 ```powershell
-.\setup_gpu.ps1
-cd frontend
-npm install
-npm run build
-cd ..
 .\start.bat
 ```
 
-`setup_gpu.ps1`은 프로젝트 전용 `.venv-gpu`를 만들고 PyTorch 2.11.0 CUDA
-13.0 빌드를 설치합니다. `start.bat`은 실행 정책과 관계없이 `start.ps1`을
-호출하며, GPU 환경이 있으면 자동으로 사용합니다.
-브라우저에서 `http://127.0.0.1:8000`을 엽니다.
+런처는 프런트엔드 패키지와 빌드 결과를 확인하고, NVIDIA GPU가 있으면 프로젝트
+전용 `.venv-gpu`와 PyTorch 2.11.0 CUDA 13.0 환경을 자동으로 준비합니다.
+첫 설치는 큰 PyTorch 패키지를 내려받으므로 몇 분 걸릴 수 있습니다. GPU 설치가
+실패하거나 NVIDIA GPU가 없으면 학습 현미경용 `.venv` CPU 환경으로 전환합니다.
+서버 준비가 끝나면 `http://127.0.0.1:8000`을 자동으로 엽니다.
+
+수동으로 GPU 환경만 먼저 준비하려면 다음 명령을 사용할 수 있습니다.
+
+```powershell
+.\setup_gpu.ps1
+```
+
+실행이 실패하면 창에 원인이 표시되고 프로젝트 루트의 `startup.log`에도
+진단 내용이 남습니다.
 
 CUDA가 준비되지 않으면 모델 공장 실행은 차단되고 GPU, 드라이버, PyTorch
 빌드, VRAM과 설치 명령을 `/api/system` 및 UI에서 진단합니다. 학습 현미경은
