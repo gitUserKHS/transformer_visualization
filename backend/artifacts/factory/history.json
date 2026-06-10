@@ -1,0 +1,193 @@
+[
+  {
+    "id": "232d6bca5c",
+    "name": "RTX 4060 acceptance",
+    "status": "completed",
+    "stage": "quantize",
+    "stage_step": 3,
+    "stage_total": 3,
+    "config": {
+      "name": "RTX 4060 acceptance",
+      "stages": [
+        "data",
+        "pretrain",
+        "sft",
+        "reward",
+        "dpo",
+        "ppo",
+        "grpo",
+        "evaluate",
+        "quantize"
+      ],
+      "pretrain_steps": 1200,
+      "sft_steps": 200,
+      "reward_steps": 150,
+      "dpo_steps": 100,
+      "ppo_steps": 30,
+      "grpo_steps": 30,
+      "micro_batch_size": 16,
+      "gradient_accumulation": 2,
+      "learning_rate": 0.0003,
+      "lora_rank": 8,
+      "response_tokens": 32,
+      "group_size": 4,
+      "seed": 42
+    },
+    "metrics": {
+      "pretrain": {
+        "step": 1200,
+        "loss": 2.201599419116974,
+        "perplexity": 9.03945982834373,
+        "gradient_norm": 1.9188231229782104
+      },
+      "sft": {
+        "step": 200,
+        "loss": 2.346937656402588,
+        "gradient_norm": 0.9673482179641724,
+        "masked_prompt_tokens": 1060,
+        "response_tokens": 988
+      },
+      "reward": {
+        "step": 150,
+        "loss": 0.05078125,
+        "chosen_reward": 0.77734375,
+        "rejected_reward": -5.25,
+        "reward_gap": 6.03125,
+        "accuracy": 0.9375
+      },
+      "dpo": {
+        "step": 100,
+        "loss": 0.28181442618370056,
+        "policy_margin": 15.210549354553223,
+        "reference_margin": 3.9876270294189453,
+        "implicit_reward_margin": 1.1222922801971436
+      },
+      "ppo": {
+        "step": 30,
+        "loss": 0.3015362024307251,
+        "reward": -6.875,
+        "value": -6.59375,
+        "advantage": -0.2840547561645508,
+        "kl": 0.05609941482543945,
+        "entropy": 2.2862114906311035,
+        "ratio": 1.0,
+        "clipped_ratio": 1.0,
+        "clip_fraction": 0.0
+      },
+      "grpo": {
+        "step": 30,
+        "loss": -0.008409854955971241,
+        "group_mean": 0.4296875,
+        "group_std": 0.416015625,
+        "advantage_mean": 0.001953125,
+        "kl": -0.12913459539413452,
+        "ranking": [
+          {
+            "response": "He picked up the machine and followed the path.",
+            "reward": 0.91796875,
+            "advantage": 1.171875
+          },
+          {
+            "response": "They went to the kitchen and looked outside.",
+            "reward": 0.6796875,
+            "advantage": 0.6015625
+          },
+          {
+            "response": "Tom looked around but the story became confused.",
+            "reward": 0.302734375,
+            "advantage": -0.3046875
+          },
+          {
+            "response": "Nothing happened and the story stopped.",
+            "reward": -0.181640625,
+            "advantage": -1.4609375
+          }
+        ]
+      },
+      "quantize": {
+        "bf16": {
+          "bytes": 31937280,
+          "mse": 0.0,
+          "note": "기준 가중치"
+        },
+        "int8": {
+          "bytes": 15968640,
+          "mse": 2.845292002007227e-8,
+          "max_error": 0.00030372291803359985,
+          "compression_ratio": 2.0,
+          "note": "실제 per-channel 복원 오차"
+        },
+        "int4": {
+          "bytes": 7984320,
+          "mse": 7.541239028796554e-6,
+          "max_error": 0.005505718756467104,
+          "compression_ratio": 4.0,
+          "group_size": 64,
+          "note": "실제 groupwise 복원 오차, fused kernel 없음"
+        }
+      }
+    },
+    "checkpoints": {
+      "base": {
+        "path": "backend/artifacts/factory/232d6bca5c/base.safetensors",
+        "bytes": 37376104
+      },
+      "sft": {
+        "path": "backend/artifacts/factory/232d6bca5c/sft.safetensors",
+        "bytes": 38247800
+      },
+      "reward_model": {
+        "path": "backend/artifacts/factory/232d6bca5c/reward_model.safetensors",
+        "bytes": 38250336
+      },
+      "dpo_adapter": {
+        "path": "backend/artifacts/factory/232d6bca5c/dpo_adapter.safetensors",
+        "bytes": 38247800
+      },
+      "ppo_adapter": {
+        "path": "backend/artifacts/factory/232d6bca5c/ppo_adapter.safetensors",
+        "bytes": 38247800
+      },
+      "grpo_adapter": {
+        "path": "backend/artifacts/factory/232d6bca5c/grpo_adapter.safetensors",
+        "bytes": 38247800
+      }
+    },
+    "comparisons": {
+      "models": {
+        "sft": {
+          "response": "She was excited to find something new and shared it with her friends.",
+          "reward": -8.25,
+          "repetition": 0.14814814814814814,
+          "safety": 1.0
+        },
+        "dpo": {
+          "response": "She lived near a big garden where a small owl always sang.",
+          "reward": -7.1875,
+          "repetition": 0.2142857142857143,
+          "safety": 1.0
+        },
+        "ppo": {
+          "response": "She carefully picked it up and hurried home to show her family.",
+          "reward": -6.75,
+          "repetition": 0.2142857142857143,
+          "safety": 1.0
+        },
+        "grpo": {
+          "response": "She wanted to visit the park and invited her friend to come along.",
+          "reward": -6.59375,
+          "repetition": 0.33333333333333337,
+          "safety": 1.0
+        }
+      },
+      "reward_hacking": {
+        "response": "reward reward reward helpful helpful helpful",
+        "proxy_reward": 0.95,
+        "quality_score": 0.12,
+        "warning": "단순 proxy를 과최적화하면 reward는 오르지만 품질은 내려갈 수 있습니다."
+      }
+    },
+    "peak_vram_bytes": 1205083648,
+    "created_at": 1781066298.4665573
+  }
+]

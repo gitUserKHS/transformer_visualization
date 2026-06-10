@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.venv-gpu/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-check/
+backend/artifacts/runs/
+backend/artifacts/history.json
+backend/data/user_preferences.jsonl
+*.log
+*.tsbuildinfo
