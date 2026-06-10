@@ -11,8 +11,10 @@ import type {
   Bootstrap,
   FactoryRunConfig,
   FactoryRunSummary,
+  NeuralTrace,
 } from "../types";
 import { LossChart } from "./LossChart";
+import { NeuralFlowLab } from "./NeuralFlowLab";
 
 const stageMeta: Record<string, [string, string]> = {
   data: ["데이터 정제", "중복·품질·언어·반복·PII"],
@@ -127,6 +129,8 @@ export function Factory({
   );
   const progress =
     run && run.stage_total ? Math.min(100, (run.stage_step / run.stage_total) * 100) : 0;
+  const neuralTrace =
+    (run?.metrics.neural_trace as unknown as NeuralTrace | undefined) ?? null;
 
   return (
     <main className="factory-page">
@@ -168,7 +172,9 @@ export function Factory({
           {bootstrap.factory.stages.map((stage, index) => {
             const meta = stageMeta[stage];
             const selected = config.stages.includes(stage);
-            const active = run?.stage === stage;
+            const active =
+              run?.stage === stage &&
+              ["running", "paused"].includes(run.status);
             return (
               <button
                 key={stage}
@@ -271,6 +277,8 @@ export function Factory({
           </div>
         </section>
       </div>
+
+      <NeuralFlowLab bootstrap={bootstrap} trace={neuralTrace} />
 
       <section className="data-line panel">
         <div className="section-heading"><div><div className="eyebrow">DATA REFINERY</div><h2>원문이 학습 데이터가 되기까지</h2></div></div>

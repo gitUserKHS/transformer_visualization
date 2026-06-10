@@ -210,6 +210,61 @@ export interface FactoryRunSummary {
   created_at: number;
 }
 
+export interface NeuralTensorStats {
+  name: string;
+  shape: number[];
+  sampled_values: number;
+  mean: number;
+  std: number;
+  rms: number;
+  max_abs: number;
+}
+
+export interface NeuralBackwardStats {
+  name: string;
+  gradient_norm: number;
+  mean_abs_gradient: number;
+  max_abs_gradient: number;
+  parameter_tensors: number;
+  elements: number;
+  sampled_parameters?: number;
+  update_rms?: number;
+  update_max_abs?: number;
+}
+
+export interface LossSurfaceTrace {
+  axis: number[];
+  losses: number[][];
+  center_loss: number;
+  minimum_loss: number;
+  minimum_at: [number, number];
+  direction_scale: number;
+  method: string;
+}
+
+export interface NeuralTrace {
+  stage: string;
+  step: number;
+  loss: number;
+  batch_shape: number[];
+  tokens: string[];
+  forward: NeuralTensorStats[];
+  attention?: {
+    q_shape?: number[];
+    kv_shape?: number[];
+    preview: number[][];
+  } | null;
+  backward: NeuralBackwardStats[];
+  optimizer: {
+    name: string;
+    learning_rate: number;
+    pre_clip_gradient_norm: number;
+    clip_limit: number;
+    clip_scale: number;
+  };
+  surface?: LossSurfaceTrace | null;
+}
+
 export interface PreferencePair {
   pair_id: string;
   prompt: string;

@@ -327,6 +327,201 @@ class FactoryManager:
         parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
         return torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=0.01)
 
+    @staticmethod
+    def _parameter_group(name: str) -> str:
+        if name.startswith(("embedding", "lm_head")):
+            return "Embedding / logits"
+        if name.startswith("blocks."):
+            index = int(name.split(".", 2)[1]) + 1
+            return f"Transformer block {index}"
+        if name.startswith("norm"):
+            return "Final RMSNorm"
+        return "Other trainable parameters"
+
+    def _gradient_flow(self, model: nn.Module) -> list[dict]:
+        groups: dict[str, dict] = {}
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad or parameter.grad is None:
+                continue
+            gradient = parameter.grad.detach().float()
+            group = groups.setdefault(
+                self._parameter_group(name),
+                {
+                    "sum_sq": 0.0,
+                    "sum_abs": 0.0,
+                    "max_abs": 0.0,
+                    "elements": 0,
+                    "tensors": 0,
+                },
+            )
+            group["sum_sq"] += float(gradient.square().sum())
+            group["sum_abs"] += float(gradient.abs().sum())
+            group["max_abs"] = max(group["max_abs"], float(gradient.abs().max()))
+            group["elements"] += gradient.numel()
+            group["tensors"] += 1
+        return [
+            {
+                "name": name,
+                "gradient_norm": math.sqrt(values["sum_sq"]),
+                "mean_abs_gradient": values["sum_abs"] / max(1, values["elements"]),
+                "max_abs_gradient": values["max_abs"],
+                "parameter_tensors": values["tensors"],
+                "elements": values["elements"],
+            }
+            for name, values in groups.items()
+        ]
+
+    def _capture_parameter_samples(self, model: nn.Module) -> dict[str, list[tuple]]:
+        samples: dict[str, list[tuple]] = {}
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            flattened = parameter.detach().flatten()
+            stride = max(1, flattened.numel() // 256)
+            before = flattened[::stride][:256].clone()
+            samples.setdefault(self._parameter_group(name), []).append(
+                (parameter, stride, before)
+            )
+        return samples
+
+    @staticmethod
+    def _parameter_updates(samples: dict[str, list[tuple]]) -> dict[str, dict]:
+        updates = {}
+        for name, rows in samples.items():
+            deltas = []
+            for parameter, stride, before in rows:
+                after = parameter.detach().flatten()[::stride][: before.numel()]
+                deltas.append((after - before).float())
+            combined = torch.cat(deltas) if deltas else torch.zeros(1)
+            updates[name] = {
+                "sampled_parameters": int(combined.numel()),
+                "update_rms": float(combined.square().mean().sqrt()),
+                "update_max_abs": float(combined.abs().max()),
+            }
+        return updates
+
+    @staticmethod
+    def _merge_backward_flow(
+        gradients: list[dict], updates: dict[str, dict]
+    ) -> list[dict]:
+        return [{**row, **updates.get(row["name"], {})} for row in gradients]
+
+    def _loss_surface(
+        self,
+        model: ProductionMiniLM,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        seed: int,
+    ) -> dict:
+        parameters = [
+            parameter for parameter in model.parameters() if parameter.requires_grad
+        ]
+        devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(seed)
+            directions = []
+            for _ in range(2):
+                direction = []
+                for parameter in parameters:
+                    random_tensor = torch.randn_like(parameter)
+                    target_norm = parameter.detach().float().norm().clamp_min(1e-4)
+                    random_norm = random_tensor.float().norm().clamp_min(1e-8)
+                    direction.append(random_tensor * (target_norm / random_norm))
+                directions.append(direction)
+
+        axis = [-1.0, -0.5, 0.0, 0.5, 1.0]
+        scale = 0.015
+        losses = []
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                for vertical in axis:
+                    row = []
+                    for horizontal in axis:
+                        for parameter, first, second in zip(
+                            parameters, directions[0], directions[1], strict=True
+                        ):
+                            parameter.add_(first, alpha=horizontal * scale)
+                            parameter.add_(second, alpha=vertical * scale)
+                        try:
+                            with self._autocast():
+                                loss = model(input_ids, labels=labels)["loss"]
+                                assert loss is not None
+                            row.append(float(loss))
+                        finally:
+                            for parameter, first, second in zip(
+                                parameters, directions[0], directions[1], strict=True
+                            ):
+                                parameter.add_(first, alpha=-horizontal * scale)
+                                parameter.add_(second, alpha=-vertical * scale)
+                    losses.append(row)
+        finally:
+            model.train(was_training)
+        flat = [
+            (loss, row_index, column_index)
+            for row_index, row in enumerate(losses)
+            for column_index, loss in enumerate(row)
+        ]
+        minimum, row_index, column_index = min(flat)
+        return {
+            "axis": axis,
+            "losses": losses,
+            "center_loss": losses[len(axis) // 2][len(axis) // 2],
+            "minimum_loss": minimum,
+            "minimum_at": [axis[column_index], axis[row_index]],
+            "direction_scale": scale,
+            "method": "현재 trainable weight 주변의 filter-normalized 2D slice",
+        }
+
+    def _record_neural_trace(
+        self,
+        state: FactoryRunState,
+        *,
+        stage: str,
+        step: int,
+        loss: float,
+        input_ids: torch.Tensor,
+        forward_flow: list[dict],
+        attention_trace: dict | None,
+        backward_flow: list[dict],
+        gradient_norm: float,
+        learning_rate: float,
+        surface: dict | None,
+    ) -> None:
+        token_ids = input_ids[0, :16].detach().cpu().tolist()
+        previous_trace = state.metrics.get("neural_trace", {})
+        if surface is None and isinstance(previous_trace, dict):
+            surface = previous_trace.get("surface")
+        attention = None
+        if attention_trace is not None:
+            matrix = attention_trace.get("attention", [])
+            attention = {
+                "q_shape": attention_trace.get("q_shape"),
+                "kv_shape": attention_trace.get("kv_shape"),
+                "preview": [row[:12] for row in matrix[:12]],
+            }
+        trace = {
+            "stage": stage,
+            "step": step,
+            "loss": loss,
+            "batch_shape": list(input_ids.shape),
+            "tokens": self.data.tokenizer.token_strings(token_ids),
+            "forward": forward_flow,
+            "attention": attention,
+            "backward": backward_flow,
+            "optimizer": {
+                "name": "AdamW",
+                "learning_rate": learning_rate,
+                "pre_clip_gradient_norm": gradient_norm,
+                "clip_limit": 1.0,
+                "clip_scale": min(1.0, 1.0 / max(gradient_norm, 1e-12)),
+            },
+            "surface": surface,
+        }
+        state.metrics["neural_trace"] = trace
+        self._emit(state, "neural_trace", trace)
+
     def _save_model(
         self, state: FactoryRunState, name: str, model: nn.Module
     ) -> None:
@@ -369,30 +564,81 @@ class FactoryManager:
         state.stage_total = state.config.pretrain_steps
         for step in range(1, state.stage_total + 1):
             self._gate(state)
+            should_trace = (
+                step == 1 or step == state.stage_total or step % 100 == 0
+            )
+            forward_flow = []
+            attention_trace = None
+            trace_batch = None
             optimizer.zero_grad(set_to_none=True)
             accumulated = 0.0
-            for _ in range(state.config.gradient_accumulation):
+            for accumulation_index in range(state.config.gradient_accumulation):
                 samples = rng.sample(packs, state.config.micro_batch_size)
                 batch = torch.tensor(samples, device="cuda")
                 x = batch[:, :-1]
+                capture = should_trace and accumulation_index == 0
                 with self._autocast():
-                    loss = model(x, labels=x)["loss"]
+                    output = model(
+                        x,
+                        labels=x,
+                        capture_layer=0 if capture else None,
+                        capture_flow=capture,
+                    )
+                    loss = output["loss"]
                     assert loss is not None
                     scaled_loss = loss / state.config.gradient_accumulation
+                if capture:
+                    forward_flow = output["flow"]
+                    attention_trace = output["trace"]
+                    trace_batch = x
                 scaled_loss.backward()
                 accumulated += float(loss.detach())
+            gradients = self._gradient_flow(model) if should_trace else []
+            parameter_samples = (
+                self._capture_parameter_samples(model) if should_trace else {}
+            )
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            backward_flow = (
+                self._merge_backward_flow(
+                    gradients, self._parameter_updates(parameter_samples)
+                )
+                if should_trace
+                else []
+            )
             state.stage_step = step
+            mean_loss = accumulated / state.config.gradient_accumulation
             metric = {
                 "step": step,
-                "loss": accumulated / state.config.gradient_accumulation,
-                "perplexity": math.exp(
-                    min(accumulated / state.config.gradient_accumulation, 20)
-                ),
+                "loss": mean_loss,
+                "perplexity": math.exp(min(mean_loss, 20)),
                 "gradient_norm": float(grad_norm),
             }
             state.metrics["pretrain"] = metric
+            if should_trace and trace_batch is not None:
+                surface = (
+                    self._loss_surface(
+                        model,
+                        trace_batch,
+                        trace_batch,
+                        state.config.seed + step,
+                    )
+                    if step == 1
+                    else None
+                )
+                self._record_neural_trace(
+                    state,
+                    stage="pretrain",
+                    step=step,
+                    loss=mean_loss,
+                    input_ids=trace_batch,
+                    forward_flow=forward_flow,
+                    attention_trace=attention_trace,
+                    backward_flow=backward_flow,
+                    gradient_norm=float(grad_norm),
+                    learning_rate=state.config.learning_rate,
+                    surface=surface,
+                )
             if step == 1 or step % 10 == 0:
                 self._emit(state, "pretrain", metric)
             self._step_done(state)
@@ -434,18 +680,38 @@ class FactoryManager:
         state.stage_total = state.config.sft_steps
         for step in range(1, state.stage_total + 1):
             self._gate(state)
+            should_trace = (
+                step == 1 or step == state.stage_total or step % 50 == 0
+            )
             examples = rng.sample(self.data.sft_examples, state.config.micro_batch_size)
             rows = [self._encode_sft(item, model.config.context_length) for item in examples]
             x, labels = self._pad(rows, model.config.context_length)
             optimizer.zero_grad(set_to_none=True)
             with self._autocast():
-                loss = model(x, labels=labels)["loss"]
+                output = model(
+                    x,
+                    labels=labels,
+                    capture_layer=0 if should_trace else None,
+                    capture_flow=should_trace,
+                )
+                loss = output["loss"]
                 assert loss is not None
             loss.backward()
+            gradients = self._gradient_flow(model) if should_trace else []
+            parameter_samples = (
+                self._capture_parameter_samples(model) if should_trace else {}
+            )
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], 1.0
             )
             optimizer.step()
+            backward_flow = (
+                self._merge_backward_flow(
+                    gradients, self._parameter_updates(parameter_samples)
+                )
+                if should_trace
+                else []
+            )
             state.stage_step = step
             metric = {
                 "step": step,
@@ -456,6 +722,30 @@ class FactoryManager:
                 "lora": lora,
             }
             state.metrics["sft"] = metric
+            if should_trace:
+                surface = (
+                    self._loss_surface(
+                        model,
+                        x,
+                        labels,
+                        state.config.seed + 10_000 + step,
+                    )
+                    if step == 1
+                    else None
+                )
+                self._record_neural_trace(
+                    state,
+                    stage="sft",
+                    step=step,
+                    loss=float(loss.detach()),
+                    input_ids=x,
+                    forward_flow=output["flow"],
+                    attention_trace=output["trace"],
+                    backward_flow=backward_flow,
+                    gradient_norm=float(grad_norm),
+                    learning_rate=state.config.learning_rate,
+                    surface=surface,
+                )
             if step == 1 or step % 5 == 0:
                 self._emit(state, "sft", metric)
             self._step_done(state)

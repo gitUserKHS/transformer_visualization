@@ -195,6 +195,21 @@ class ProductionMiniLM(nn.Module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    @staticmethod
+    def _tensor_stats(name: str, tensor: torch.Tensor) -> dict:
+        detached = tensor.detach().flatten()
+        stride = max(1, detached.numel() // 65_536)
+        sample = detached[::stride][:65_536].float()
+        return {
+            "name": name,
+            "shape": list(tensor.shape),
+            "sampled_values": int(sample.numel()),
+            "mean": float(sample.mean()),
+            "std": float(sample.std(unbiased=False)),
+            "rms": float(sample.square().mean().sqrt()),
+            "max_abs": float(sample.abs().max()),
+        }
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -202,6 +217,7 @@ class ProductionMiniLM(nn.Module):
         past_key_values: KVCache | None = None,
         use_cache: bool = False,
         capture_layer: int | None = None,
+        capture_flow: bool = False,
     ) -> dict:
         _, length = input_ids.shape
         past_length = (
@@ -215,6 +231,7 @@ class ProductionMiniLM(nn.Module):
             past_length, past_length + length, device=input_ids.device
         )
         x = self.embedding(input_ids)
+        flow = [self._tensor_stats("Token embedding", x)] if capture_flow else []
         presents: KVCache = []
         captured = None
         for index, block in enumerate(self.blocks):
@@ -223,10 +240,16 @@ class ProductionMiniLM(nn.Module):
                 x, positions, past, use_cache, capture_layer == index
             )
             presents.append(present)
+            if capture_flow:
+                flow.append(self._tensor_stats(f"Transformer block {index + 1}", x))
             if trace is not None:
                 captured = {"layer": index, **trace}
         hidden = self.norm(x)
+        if capture_flow:
+            flow.append(self._tensor_stats("Final RMSNorm", hidden))
         logits = self.lm_head(hidden)
+        if capture_flow:
+            flow.append(self._tensor_stats("Vocabulary logits", logits))
         loss = None
         if labels is not None:
             loss = F.cross_entropy(
@@ -240,6 +263,7 @@ class ProductionMiniLM(nn.Module):
             "hidden_states": hidden,
             "past_key_values": presents if use_cache else None,
             "trace": captured,
+            "flow": flow,
         }
 
     @property
